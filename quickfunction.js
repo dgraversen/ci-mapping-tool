@@ -769,12 +769,18 @@
     return paths;
   }
 
+  // The file input is attached to the page while the dialog is open: a detached input can be garbage
+  // collected before Chrome delivers the chosen file, and then nothing happens at all.
   function pickFile() {
     return new Promise((resolve) => {
       const input = document.createElement("input");
       input.type = "file";
       input.accept = ".json,application/json";
-      input.onchange = () => resolve(input.files && input.files[0]);
+      input.style.display = "none";
+      document.body.appendChild(input);
+      const done = (file) => { input.remove(); resolve(file || null); };
+      input.addEventListener("change", () => done(input.files && input.files[0]));
+      input.addEventListener("cancel", () => done(null));
       input.click();
     });
   }
@@ -1222,8 +1228,11 @@
           close();
           runAction("import mappings", async () => {
             const file = await picked;
-            if (!file) return;
+            if (!file) { toast("Mapping Toolkit: import cancelled – no file chosen."); return; }
+            toast(`Mapping Toolkit: importing ${file.name}…`);
+            console.info("[CI Mapping Toolkit] importing", file.name, it.replace ? "(overwrite)" : "(only unmapped)");
             const r = await importMappings(file, it.replace);
+            console.info("[CI Mapping Toolkit] import result", r);
             toast(`Mapping Toolkit: import done – ${r.added} fields added, ${r.replaced} overwritten, ${r.kept} already mapped and left unchanged` +
               (r.noTarget ? `, ${r.noTarget} not in this target structure` : "") +
               (r.missingSources ? `, ${r.missingSources} use source fields missing here` : "") + ".");
