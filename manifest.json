@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "CI Mapping Toolkit",
+  "version": "2.1.0",
+  "description": "Tools for the SAP Cloud Integration message mapping editor: quick functions and constants, mapping templates, formatting, export and import.",
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["https://*.hana.ondemand.com/*", "https://*.cloud.sap/*"],
+      "js": ["bridge.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": ["https://*.hana.ondemand.com/*", "https://*.cloud.sap/*"],
+      "js": ["quickfunction.js"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ]
+}
