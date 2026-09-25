@@ -15,6 +15,12 @@ mappings between message mappings, or getting a read-only mapping into Edit mode
 
 ![The Mapping Toolkit button next to Simulate in the message mapping editor](docs/screenshots/editor-overview.png)
 
+### Watch the introduction
+
+[![CI Mapping Toolkit – introduction video](https://img.youtube.com/vi/SU1wsei3DT4/hqdefault.jpg)](https://youtu.be/SU1wsei3DT4)
+
+A short walkthrough of the toolkit in a real message mapping: [youtu.be/SU1wsei3DT4](https://youtu.be/SU1wsei3DT4)
+
 > **Looking for more?** CI Mapping Toolkit is a free helper for one part of the job. For managing,
 > testing, documenting and transporting your integrations end to end, have a look at the
 > [Figaf Tool](https://figaf.com), which gives you far more productivity across SAP Integration Suite
