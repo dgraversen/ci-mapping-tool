@@ -590,6 +590,7 @@
   function formatMapping(m) {
     const det = m && m.destination && m.destination.expressionDetails;
     if (!det) return false;
+    try { console.info("[CI Mapping Toolkit] format data (before)", JSON.stringify({ destination: m.destination, unconnected: m.unconnected })); } catch (_) { /* not serialisable */ }
     let bottom = layoutTree(det, null, LAYOUT.top, String((m.targetPaths || [""])[0]).split("/").pop());
     (m.unconnected || []).forEach((u) => {
       const node = u.graphicalFunction || u.graphicalNode || u;
