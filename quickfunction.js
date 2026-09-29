@@ -492,10 +492,10 @@
     scaleX: 1.8, scaleY: 1.2,
     left: 20, top: 40,
     boxWidth: 135,   // CPI draws boxes at least ~135px wide
-    colGap: 120,     // about one box between two columns
-    gap: 22,         // vertical space between boxes
+    colGap: 50,      // space between two columns
+    gap: 16,         // vertical space between boxes
     nodeHeight: 40, rowHeight: 30,
-    colWidth: 255,   // boxWidth + colGap, used where no widths are known
+    colWidth: 185,   // boxWidth + colGap, used where no widths are known
   };
   // CPI saves whole numbers only; a decimal position makes the save fail.
   const toStored = (x, y) => ({ x: Math.round(x / LAYOUT.scaleX), y: Math.round(y / LAYOUT.scaleY) });
@@ -536,8 +536,10 @@
   function layoutTree(rootDet, rootNode, startY, rootLabel) {
     const depth = new Map();   // objectId -> longest distance from the root
     const byId = new Map();    // objectId -> node (first occurrence; shared outputs appear more than once)
+    const copies = [];         // every occurrence of every box: a box feeding two inputs is stored twice
     (function measure(det, node, d, trail) {
       const id = det.objectId || det;
+      copies.push(det);
       if (trail.has(id)) return;
       if (!byId.has(id)) byId.set(id, node);
       if ((depth.get(id) || -1) < d) depth.set(id, d);
@@ -556,6 +558,7 @@
     colW.reduce((x, w, i) => { colX[i] = x; return x + w + LAYOUT.colGap; }, LAYOUT.left);
     let nextY = startY;
     const placed = new Set();
+    const positions = new Map(); // objectId -> new stored position
     (function place(det, node) {
       const id = det.objectId || det;
       if (placed.has(id)) return null;
@@ -567,8 +570,11 @@
       else { y = nextY; }
       nextY = Math.max(nextY, y + h + LAYOUT.gap);
       det.position = toStored(colX[maxDepth - depth.get(id)], y);
+      positions.set(id, det.position);
       return y;
     })(rootDet, rootNode);
+    // CPI may draw a shared box from any of its copies, so every copy gets the same position.
+    copies.forEach((d) => { const pos = positions.get(d.objectId || d); if (pos) d.position = { x: pos.x, y: pos.y }; });
     return nextY;
   }
 
