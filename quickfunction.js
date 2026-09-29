@@ -492,10 +492,10 @@
     scaleX: 1.8, scaleY: 1.2,
     left: 20, top: 40,
     boxWidth: 135,   // CPI draws boxes at least ~135px wide
-    colGap: 50,      // space between two columns
-    gap: 16,         // vertical space between boxes
+    colGap: 120,     // about one box between two columns
+    gap: 22,         // vertical space between boxes
     nodeHeight: 40, rowHeight: 30,
-    colWidth: 185,   // boxWidth + colGap, used where no widths are known
+    colWidth: 255,   // boxWidth + colGap, used where no widths are known
   };
   // CPI saves whole numbers only; a decimal position makes the save fail.
   const toStored = (x, y) => ({ x: Math.round(x / LAYOUT.scaleX), y: Math.round(y / LAYOUT.scaleY) });
