@@ -533,20 +533,30 @@
   }
 
   // Lays out one tree whose root is a Dst details object or an unconnected node; returns the bottom y used (canvas px).
+  // A box that feeds several inputs shows up several times in the tree. Source fields are one box per path, other
+  // boxes one per objectId; a copy may even lack its own details, so the tree is followed through the pins.
   function layoutTree(rootDet, rootNode, startY, rootLabel) {
-    const depth = new Map();   // objectId -> longest distance from the root
-    const byId = new Map();    // objectId -> node (first occurrence; shared outputs appear more than once)
-    const copies = [];         // every occurrence of every box: a box feeding two inputs is stored twice
-    (function measure(det, node, d, trail) {
-      const id = det.objectId || det;
-      copies.push(det);
+    const item = (node, det) => ({ node, det });
+    const kidsOf = (it) => ((it.det && it.det.pinins) || []).slice().sort((a, b) => a.pinNum - b.pinNum)
+      .map((pin) => pin.pinout && pin.pinout.expressionReference)
+      .map((ref) => ref && (ref.graphicalFunction || ref.graphicalNode))
+      .filter(Boolean).map((n) => item(n, n.expressionDetails));
+    const keyOf = (it) => it.node && it.node.expressionPath && !it.node.key ? "src:" + it.node.expressionPath
+      : it.det ? (it.det.objectId || it.det) : it.node;
+    const root = item(rootNode, rootDet);
+    const depth = new Map();   // box key -> longest distance from the root
+    const byId = new Map();    // box key -> node (first occurrence)
+    const copies = [];         // every occurrence of every box
+    (function measure(it, d, trail) {
+      const id = keyOf(it);
+      copies.push(it);
       if (trail.has(id)) return;
-      if (!byId.has(id)) byId.set(id, node);
+      if (!byId.has(id)) byId.set(id, it.node);
       if ((depth.get(id) || -1) < d) depth.set(id, d);
       trail.add(id);
-      childrenOf(det).forEach((c) => measure(c.expressionDetails, c, d + 1, trail));
+      kidsOf(it).forEach((c) => measure(c, d + 1, trail));
       trail.delete(id);
-    })(rootDet, rootNode, 0, new Set());
+    })(root, 0, new Set());
     const maxDepth = Math.max(...depth.values());
     // Column 0 is the leftmost (deepest) one; x of a column = widths of the columns before it plus a gap each.
     const colW = new Array(maxDepth + 1).fill(0);
@@ -558,23 +568,22 @@
     colW.reduce((x, w, i) => { colX[i] = x; return x + w + LAYOUT.colGap; }, LAYOUT.left);
     let nextY = startY;
     const placed = new Set();
-    const positions = new Map(); // objectId -> new stored position
-    (function place(det, node) {
-      const id = det.objectId || det;
+    const positions = new Map(); // box key -> new stored position
+    (function place(it) {
+      const id = keyOf(it);
       if (placed.has(id)) return null;
       placed.add(id);
-      const kids = childrenOf(det).map((c) => place(c.expressionDetails, c)).filter((y) => y !== null);
-      const h = node ? nodeHeight(node) : LAYOUT.nodeHeight;
+      const kids = kidsOf(it).map(place).filter((y) => y !== null);
+      const h = it.node ? nodeHeight(it.node) : LAYOUT.nodeHeight;
       let y;
       if (kids.length) y = Math.round((kids[0] + kids[kids.length - 1]) / 2);
       else { y = nextY; }
       nextY = Math.max(nextY, y + h + LAYOUT.gap);
-      det.position = toStored(colX[maxDepth - depth.get(id)], y);
-      positions.set(id, det.position);
+      positions.set(id, toStored(colX[maxDepth - depth.get(id)], y));
       return y;
-    })(rootDet, rootNode);
+    })(root);
     // CPI may draw a shared box from any of its copies, so every copy gets the same position.
-    copies.forEach((d) => { const pos = positions.get(d.objectId || d); if (pos) d.position = { x: pos.x, y: pos.y }; });
+    copies.forEach((it) => { const pos = positions.get(keyOf(it)); if (pos && it.det) it.det.position = { x: pos.x, y: pos.y }; });
     return nextY;
   }
 
