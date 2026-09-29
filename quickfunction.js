@@ -15,7 +15,7 @@
   "use strict";
   if (window.__cpiQuickFunction) return;
   window.__cpiQuickFunction = true;
-  console.info("[CI Mapping Toolkit] loaded in", location.href);
+  console.info("[CI Mapping Toolkit] v2.2.3 loaded in", location.href);
 
   const PALETTE_TYPE = "com.sap.it.spc.webui.expressionedit.FunctionPalette";
   const EDITOR_TYPE = "com.sap.it.spc.webui.expressionedit.ExpressionEditorControl";

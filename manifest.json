@@ -1,7 +1,7 @@
 ﻿{
   "manifest_version": 3,
   "name": "CI Mapping Toolkit",
-  "version": "2.2.2",
+  "version": "2.2.3",
   "description": "Tools for the SAP Cloud Integration message mapping editor: quick functions and constants, mapping templates, formatting, export and import.",
   "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
   "permissions": ["storage"],
