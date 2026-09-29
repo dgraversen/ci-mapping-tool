@@ -15,7 +15,7 @@
   "use strict";
   if (window.__cpiQuickFunction) return;
   window.__cpiQuickFunction = true;
-  console.info("[CI Mapping Toolkit] loaded in", location.href);
+  console.info("[CI Mapping Toolkit] v2.2.3 loaded in", location.href);
 
   const PALETTE_TYPE = "com.sap.it.spc.webui.expressionedit.FunctionPalette";
   const EDITOR_TYPE = "com.sap.it.spc.webui.expressionedit.ExpressionEditorControl";
@@ -306,6 +306,31 @@
     });
   }
 
+  // A box (function or source field) that feeds several inputs is stored in full once; the other inputs hold
+  // {exprReference: <objectId of that box>}. boxes maps objectId -> box for everything reachable from the given pins/nodes.
+  function collectBoxes(pinins, boxes) {
+    (pinins || []).forEach((pin) => {
+      const ref = pin && pin.pinout && pin.pinout.expressionReference;
+      const n = ref && (ref.graphicalFunction || ref.graphicalNode);
+      if (!n || !n.expressionDetails) return;
+      if (n.expressionDetails.objectId) boxes.set(n.expressionDetails.objectId, n);
+      collectBoxes(n.expressionDetails.pinins, boxes);
+    });
+    return boxes;
+  }
+  function boxesOfMapping(m) {
+    const boxes = new Map();
+    collectBoxes(m.destination && m.destination.expressionDetails && m.destination.expressionDetails.pinins, boxes);
+    (m.unconnected || []).forEach((u) => {
+      const n = (u && (u.graphicalFunction || u.graphicalNode)) || u;
+      if (n && n.expressionDetails) {
+        if (n.expressionDetails.objectId) boxes.set(n.expressionDetails.objectId, n);
+        collectBoxes(n.expressionDetails.pinins, boxes);
+      }
+    });
+    return boxes;
+  }
+
   function describeTemplate(pinins) {
     const fns = [];
     const sources = [];
@@ -316,25 +341,48 @@
     return { fns, sources: [...new Set(sources)] };
   }
 
+  // Removes the source fields, and the inputs that only pointed at a removed source.
   function stripSources(pinins) {
-    (pinins || []).forEach((pin) => {
+    const removed = new Set();
+    const strip = (pins) => (pins || []).forEach((pin) => {
       const ref = pin && pin.pinout && pin.pinout.expressionReference;
       if (!ref) return;
-      if (ref.graphicalNode) delete pin.pinout;
-      else if (ref.graphicalFunction && ref.graphicalFunction.expressionDetails) stripSources(ref.graphicalFunction.expressionDetails.pinins);
+      if (ref.graphicalNode) {
+        if (ref.graphicalNode.expressionDetails && ref.graphicalNode.expressionDetails.objectId) removed.add(ref.graphicalNode.expressionDetails.objectId);
+        delete pin.pinout;
+      } else if (ref.graphicalFunction && ref.graphicalFunction.expressionDetails) strip(ref.graphicalFunction.expressionDetails.pinins);
     });
+    const unlink = (pins) => (pins || []).forEach((pin) => {
+      const ref = pin && pin.pinout && pin.pinout.expressionReference;
+      if (!ref) return;
+      if (ref.exprReference && removed.has(ref.exprReference)) delete pin.pinout;
+      else if (ref.graphicalFunction && ref.graphicalFunction.expressionDetails) unlink(ref.graphicalFunction.expressionDetails.pinins);
+    });
+    strip(pinins);
+    unlink(pinins);
   }
 
+  // Gives every box a new objectId and keeps the {exprReference} pointers between the boxes valid.
   function renewIds(o) {
-    if (!o || typeof o !== "object") return;
-    if (typeof o.objectId === "string") o.objectId = newId();
-    for (const k in o) renewIds(o[k]);
+    const ids = new Map();
+    (function renew(x) {
+      if (!x || typeof x !== "object") return;
+      if (typeof x.objectId === "string") { const id = newId(); ids.set(x.objectId, id); x.objectId = id; }
+      for (const k in x) renew(x[k]);
+    })(o);
+    (function relink(x) {
+      if (!x || typeof x !== "object") return;
+      if (typeof x.exprReference === "string" && ids.has(x.exprReference)) x.exprReference = ids.get(x.exprReference);
+      for (const k in x) relink(x[k]);
+    })(o);
   }
 
   // Text form of the expression, e.g. readProperty(const("x"),"").
   function expressionText(pinins) {
+    const boxes = collectBoxes(pinins, new Map());
     const ref = (pin) => {
-      const r = pin && pin.pinout && pin.pinout.expressionReference;
+      let r = pin && pin.pinout && pin.pinout.expressionReference;
+      if (r && r.exprReference) { const b = boxes.get(r.exprReference); r = b && (b.key ? { graphicalFunction: b } : { graphicalNode: b }); }
       if (!r) return "";
       if (r.graphicalNode) return r.graphicalNode.expressionPath || "";
       const f = r.graphicalFunction;
@@ -533,18 +581,30 @@
   }
 
   // Lays out one tree whose root is a Dst details object or an unconnected node; returns the bottom y used (canvas px).
-  function layoutTree(rootDet, rootNode, startY, rootLabel) {
-    const depth = new Map();   // objectId -> longest distance from the root
-    const byId = new Map();    // objectId -> node (first occurrence; shared outputs appear more than once)
-    (function measure(det, node, d, trail) {
-      const id = det.objectId || det;
+  // A box that feeds several inputs shows up several times in the tree. Source fields are one box per path, other
+  // boxes one per objectId; a copy may even lack its own details, so the tree is followed through the pins.
+  function layoutTree(rootDet, rootNode, startY, rootLabel, boxes) {
+    const item = (node, det) => ({ node, det });
+    const kidsOf = (it) => ((it.det && it.det.pinins) || []).slice().sort((a, b) => a.pinNum - b.pinNum)
+      .map((pin) => pin.pinout && pin.pinout.expressionReference)
+      .map((ref) => ref && (ref.exprReference ? boxes && boxes.get(ref.exprReference) : ref.graphicalFunction || ref.graphicalNode))
+      .filter(Boolean).map((n) => item(n, n.expressionDetails));
+    const keyOf = (it) => it.node && it.node.expressionPath && !it.node.key ? "src:" + it.node.expressionPath
+      : it.det ? (it.det.objectId || it.det) : it.node;
+    const root = item(rootNode, rootDet);
+    const depth = new Map();   // box key -> longest distance from the root
+    const byId = new Map();    // box key -> node (first occurrence)
+    const copies = [];         // every occurrence of every box
+    (function measure(it, d, trail) {
+      const id = keyOf(it);
+      copies.push(it);
       if (trail.has(id)) return;
-      if (!byId.has(id)) byId.set(id, node);
+      if (!byId.has(id)) byId.set(id, it.node);
       if ((depth.get(id) || -1) < d) depth.set(id, d);
       trail.add(id);
-      childrenOf(det).forEach((c) => measure(c.expressionDetails, c, d + 1, trail));
+      kidsOf(it).forEach((c) => measure(c, d + 1, trail));
       trail.delete(id);
-    })(rootDet, rootNode, 0, new Set());
+    })(root, 0, new Set());
     const maxDepth = Math.max(...depth.values());
     // Column 0 is the leftmost (deepest) one; x of a column = widths of the columns before it plus a gap each.
     const colW = new Array(maxDepth + 1).fill(0);
@@ -556,29 +616,33 @@
     colW.reduce((x, w, i) => { colX[i] = x; return x + w + LAYOUT.colGap; }, LAYOUT.left);
     let nextY = startY;
     const placed = new Set();
-    (function place(det, node) {
-      const id = det.objectId || det;
+    const positions = new Map(); // box key -> new stored position
+    (function place(it) {
+      const id = keyOf(it);
       if (placed.has(id)) return null;
       placed.add(id);
-      const kids = childrenOf(det).map((c) => place(c.expressionDetails, c)).filter((y) => y !== null);
-      const h = node ? nodeHeight(node) : LAYOUT.nodeHeight;
+      const kids = kidsOf(it).map(place).filter((y) => y !== null);
+      const h = it.node ? nodeHeight(it.node) : LAYOUT.nodeHeight;
       let y;
       if (kids.length) y = Math.round((kids[0] + kids[kids.length - 1]) / 2);
       else { y = nextY; }
       nextY = Math.max(nextY, y + h + LAYOUT.gap);
-      det.position = toStored(colX[maxDepth - depth.get(id)], y);
+      positions.set(id, toStored(colX[maxDepth - depth.get(id)], y));
       return y;
-    })(rootDet, rootNode);
+    })(root);
+    // CPI may draw a shared box from any of its copies, so every copy gets the same position.
+    copies.forEach((it) => { const pos = positions.get(keyOf(it)); if (pos && it.det) it.det.position = { x: pos.x, y: pos.y }; });
     return nextY;
   }
 
   function formatMapping(m) {
     const det = m && m.destination && m.destination.expressionDetails;
     if (!det) return false;
-    let bottom = layoutTree(det, null, LAYOUT.top, String((m.targetPaths || [""])[0]).split("/").pop());
+    const boxes = boxesOfMapping(m);
+    let bottom = layoutTree(det, null, LAYOUT.top, String((m.targetPaths || [""])[0]).split("/").pop(), boxes);
     (m.unconnected || []).forEach((u) => {
       const node = u.graphicalFunction || u.graphicalNode || u;
-      if (node && node.expressionDetails) bottom = layoutTree(node.expressionDetails, node, bottom + LAYOUT.gap);
+      if (node && node.expressionDetails) bottom = layoutTree(node.expressionDetails, node, bottom + LAYOUT.gap, undefined, boxes);
     });
     return true;
   }
@@ -1064,7 +1128,7 @@
       if (m) replaced++; else { m = ctx.controller._createConstantMapping("", tps[0]); added++; }
       const dest = clone(e.destination);
       const unc = clone(e.unconnected || []);
-      renewIds(dest); renewIds(unc);
+      renewIds({ dest, unc }); // one pass, so pointers between the connected and unconnected boxes stay valid
       m.targetPaths = tps.slice();
       m.destination = dest;
       m.unconnected = unc;
