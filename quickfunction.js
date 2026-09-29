@@ -170,10 +170,39 @@
     ctx.renderer.renderExpression(expr);
   }
 
-  function connect(expr, fromNode, dst) {
+  function connect(expr, fromNode, dst, toPin) {
     const models = com.sap.it.spc.webui.mapping.expression.models;
     expr.connections = expr.connections || [];
-    expr.connections.push(new models.Connection(dst.id, fromNode.id, 0, 0));
+    const c = new models.Connection(dst.id, fromNode.id, 0, 0);
+    if (toPin) c.toPin = toPin;
+    expr.connections.push(c);
+  }
+
+  // Free inputs of the boxes drawn on the canvas, from the open expression (canvas px): the target field first,
+  // then top to bottom. Same shape as freeInputs() so pickInputOnCanvas() can show either.
+  function expressionInputs(ctx, targetName) {
+    const expr = getExpression(ctx);
+    if (!expr || !expr.nodes) return [];
+    const fns = ctx.palette ? getFunctions(ctx.palette) : [];
+    const used = new Set((expr.connections || []).map((c) => c.toId + ":" + c.toPin));
+    const out = [];
+    Object.values(expr.nodes).forEach((n) => {
+      if (typeof n.x !== "number" || n.type === "Src") return;
+      const isDst = n.type === "Dst";
+      const pins = isDst ? 1 : (n.noOfArguments || 0);
+      const fn = !isDst && fns.find((f) => f.name === n.key);
+      const args = (fn && fn.signature && fn.signature.arguments) || [];
+      const expanded = !!n.expansionState && !isDst;
+      const h = expanded ? LAYOUT.nodeHeight + (pins + (n.valueBindingArgs || []).length) * LAYOUT.rowHeight : LAYOUT.nodeHeight;
+      const box = { x: n.x, y: n.y, w: NODE_W, h };
+      for (let i = 0; i < pins; i++) {
+        if (used.has(n.id + ":" + i)) continue;
+        const arg = args[i] && (args[i].displayName || args[i].name);
+        out.push({ node: n, pin: i, index: i, isDst, title: isDst ? targetName : (n.name || n.key), arg: arg || "input " + (i + 1),
+          rect: expanded ? { x: n.x, y: n.y + LAYOUT.nodeHeight + i * LAYOUT.rowHeight, w: NODE_W, h: LAYOUT.rowHeight, box } : Object.assign({ box }, box) });
+      }
+    });
+    return out.sort((a, b) => (b.isDst - a.isDst) || a.rect.box.y - b.rect.box.y || a.rect.box.x - b.rect.box.x || a.index - b.index);
   }
 
   function setConstantValue(node, value) {
@@ -202,18 +231,30 @@
 
   // Selected field already has a mapping: add the node (at the mouse when it is over the canvas).
   // If nothing is connected to the target field yet, connect the new node to it.
-  function insertIntoMapping(ctx, fn, constValue) {
+  // In a mapped field the user moves a selection box to the input the function should feed (or picks "not connected").
+  async function insertIntoMapping(ctx, fn, constValue) {
     const expr = getExpression(ctx);
     const dst = getTargetNode(expr);
     const autoConnect = !!(dst && !isTargetMapped(expr, dst));
     let pos = mousePosOnCanvas();
+    let chosen = null;
+    if (!autoConnect) {
+      const inputs = expressionInputs(ctx, (getSelectedTarget(ctx) || {}).name || dst && dst.name || "the target field");
+      if (inputs.length) {
+        const c = await pickInputOnCanvas(inputs, { name: fn.displayName || fn.name });
+        if (c === undefined) return; // cancelled
+        if (c && c !== "none") { chosen = c; pos = { x: Math.max(0, c.node.x - 220), y: c.node.y + c.index * LAYOUT.rowHeight }; }
+        ctx = getContext(); // the editor may have been redrawn while the user was choosing
+      }
+    }
     if (!pos && autoConnect && typeof dst.x === "number") pos = { x: Math.max(0, dst.x - 220), y: dst.y || 0 };
     const node = addNode(ctx, fn, pos && pos.x, pos && pos.y);
     if (!node) return;
     const cur = getExpression(ctx);
     if (constValue !== undefined) setConstantValue(node, constValue);
     if (autoConnect) connect(cur, node, getTargetNode(cur));
-    if (constValue !== undefined || autoConnect) commit(ctx, cur);
+    else if (chosen && cur.nodes[chosen.node.id]) connect(cur, node, cur.nodes[chosen.node.id], chosen.pin);
+    if (constValue !== undefined || autoConnect || chosen) commit(ctx, cur);
   }
 
   // Selected field has no mapping: create one the way CPI's own constant assignment does,
@@ -308,14 +349,14 @@
 
   // The function (or source field) node the user last clicked on the canvas, if it is in the open expression.
   const NODE_W = 150; // canvas px
-  function getClickedNode(ctx) {
+  function getClickedNode(ctx, tolerance) {
     const expr = getExpression(ctx);
     if (!lastCanvasClick || !expr || !expr.nodes) return null;
     const p = lastCanvasClick;
     const target = getSelectedTarget(ctx);
     if (p.xpath && target && p.xpath !== target.xpath) return null; // click belonged to another field's mapping
     let best = null;
-    let bestD = 60; // px tolerance around a node
+    let bestD = tolerance === undefined ? 60 : tolerance + 1; // px tolerance around a node
     Object.values(expr.nodes).forEach((n) => {
       if (n.type === "Dst" || typeof n.x !== "number") return;
       const h = n.expansionState ? LAYOUT.nodeHeight + ((n.noOfArguments || 0) + ((n.valueBindingArgs || []).length)) * LAYOUT.rowHeight : LAYOUT.nodeHeight;
@@ -612,6 +653,236 @@
     return out;
   }
 
+  // New mapping with an unconnected target field, like after deleting its only connection.
+  function createEmptyMapping(ctx, target) {
+    const m = ctx.controller._createConstantMapping("", target.xpath);
+    m.destination = {
+      expressionPath: target.xpath, isXml: false, displayPath: target.xpath,
+      expressionDetails: { gid: "0", objectId: newId(), position: { x: 200, y: 40 }, pinins: [{ pinNum: 0 }], type: "Dst" },
+    };
+    m.sourcePaths = [];
+    m.fn = { expression: "" };
+    return m;
+  }
+
+  // ---------- source fields added from the keyboard ----------
+  // Every field of the source structure, in document order: [{xpath, name}].
+  function sourceEntries(ctx) {
+    const tr = ctx.viewer.getTransformation();
+    const msg = tr.getSourceMessage ? tr.getSourceMessage() : tr.source;
+    const out = [];
+    const seen = new Set();
+    const visited = new Set();
+    (function walk(o, d) {
+      if (!o || typeof o !== "object" || visited.has(o) || d > 60) return;
+      visited.add(o);
+      if (typeof o.xpath === "string" && !seen.has(o.xpath)) {
+        seen.add(o.xpath);
+        out.push({ xpath: o.xpath, name: o.name || o.xpath.split("/").pop() });
+      }
+      for (const k in o) { const v = o[k]; if (v && typeof v === "object") walk(v, d + 1); }
+    })(msg, 0);
+    return out;
+  }
+
+  // The row selected in the source structure, if any.
+  function getSelectedSourcePath(ctx) {
+    try {
+      const t = ctx.viewer._getSourceTable();
+      const i = t.getSelectedIndex();
+      const o = i >= 0 && t.getContextByIndex(i).getObject();
+      return o && o.xpath || null;
+    } catch (_) { return null; }
+  }
+
+  // Inputs of the mapping that can take a source field: {detId, pinNum, name, desc, x, y}.
+  // The target field comes first, then the free inputs of every function, then those of unconnected functions.
+  function freeInputs(ctx, m, targetName) {
+    const fns = ctx.palette ? getFunctions(ctx.palette) : [];
+    const out = [];
+    const seen = new Set();
+    // rect: where the input is drawn on the canvas (canvas px), worked out the same way as the format layout.
+    const rectOf = (det, node, title, i) => {
+      const p = det.position;
+      if (!p) return null;
+      const x = p.x * LAYOUT.scaleX;
+      const y = p.y * LAYOUT.scaleY;
+      const w = nodeWidth(node, node ? "" : title);
+      const collapsed = !node || node.expansionState === false || node.key === "const";
+      const h = collapsed ? LAYOUT.nodeHeight : nodeHeight(node);
+      return collapsed ? { x, y, w, h, box: { x, y, w, h } }
+        : { x, y: y + LAYOUT.nodeHeight + i * LAYOUT.rowHeight, w, h: LAYOUT.rowHeight, box: { x, y, w, h } };
+    };
+    const visit = (det, node, title, fn) => {
+      if (!det || seen.has(det)) return;
+      seen.add(det);
+      const args = (fn && fn.signature && fn.signature.arguments) || [];
+      (det.pinins || []).slice().sort((a, b) => a.pinNum - b.pinNum).forEach((pin, i) => {
+        const ref = pin.pinout && pin.pinout.expressionReference;
+        if (!ref) {
+          const arg = args[i] && (args[i].displayName || args[i].name);
+          out.push({ detId: det.objectId, pinNum: pin.pinNum, index: i, title, arg: arg || "input " + (i + 1), isDst: det.type === "Dst",
+            rect: rectOf(det, node, title, i) });
+        } else if (ref.graphicalFunction) {
+          const f = ref.graphicalFunction;
+          visit(f.expressionDetails, f, f.name || f.key, fns.find((g) => g.name === f.key));
+        }
+      });
+    };
+    visit(m.destination.expressionDetails, null, targetName, null);
+    (m.unconnected || []).forEach((u) => {
+      const n = nodeOf(u);
+      if (n && n.expressionDetails) visit(n.expressionDetails, n, n.name || n.key, fns.find((f) => f.name === n.key));
+    });
+    return out;
+  }
+
+  // Lets the user move a selection box over the free inputs on the canvas with the arrow keys.
+  // Resolves with the chosen input, null for "not connected", or undefined when cancelled.
+  let pickerActive = false;
+  function pickInputOnCanvas(inputs, entry) {
+    return new Promise((resolve) => {
+      const canvas = getCanvas();
+      const cands = inputs.filter((c) => c.rect);
+      if (!canvas || !cands.length) return resolve("none");
+      const bottom = Math.max(...cands.map((c) => c.rect.box.y + c.rect.box.h));
+      const loose = { loose: true, arg: "not connected", title: "", rect: { x: 10, y: bottom + 30, w: 150, h: LAYOUT.nodeHeight } };
+      loose.rect.box = loose.rect;
+      const list = cands.concat([loose]);
+      let cur = 0;
+
+      const layer = document.createElement("div");
+      Object.assign(layer.style, { position: "fixed", zIndex: 2147483645, overflow: "hidden", pointerEvents: "none" });
+      const boxEl = document.createElement("div");
+      const rowEl = document.createElement("div");
+      Object.assign(boxEl.style, { position: "absolute", border: "2px dashed #0a6ed1", borderRadius: "6px", boxSizing: "border-box" });
+      Object.assign(rowEl.style, { position: "absolute", background: "rgba(10,110,209,.28)", border: "2px solid #0a6ed1", borderRadius: "4px", boxSizing: "border-box" });
+      layer.append(boxEl, rowEl);
+      const hud = document.createElement("div");
+      Object.assign(hud.style, { position: "fixed", bottom: "32px", left: "50%", transform: "translateX(-50%)", zIndex: 2147483647,
+        background: "#32363a", color: "#fff", padding: "10px 16px", borderRadius: "8px", font: '14px "72", Arial, sans-serif',
+        boxShadow: "0 4px 16px rgba(0,0,0,.3)", maxWidth: "90vw" });
+      document.body.append(layer, hud);
+
+      const place = (r, el) => {
+        Object.assign(el.style, { left: r.x - canvas.scrollLeft + "px", top: r.y - canvas.scrollTop + "px", width: r.w + "px", height: r.h + "px" });
+      };
+      const draw = () => {
+        const c = list[cur];
+        const cr = canvas.getBoundingClientRect();
+        Object.assign(layer.style, { left: cr.left + "px", top: cr.top + "px", width: cr.width + "px", height: cr.height + "px" });
+        // keep the selection in view
+        const b = c.rect.box;
+        if (b.y < canvas.scrollTop) canvas.scrollTop = Math.max(0, b.y - 20);
+        else if (b.y + b.h > canvas.scrollTop + cr.height) canvas.scrollTop = b.y + b.h - cr.height + 20;
+        if (b.x < canvas.scrollLeft) canvas.scrollLeft = Math.max(0, b.x - 20);
+        else if (b.x + b.w > canvas.scrollLeft + cr.width) canvas.scrollLeft = b.x + b.w - cr.width + 20;
+        place(b, boxEl);
+        place(c.rect, rowEl);
+        boxEl.style.display = c.rect.y === b.y && c.rect.h === b.h ? "none" : "block";
+        hud.textContent = "Add " + entry.name + " – " + (c.loose ? "not connected" : c.isDst ? "connect to the target field" : "connect to " + c.arg + " of " + c.title) +
+          "   ·   ←↑↓→ move   ·   Enter place   ·   Esc cancel";
+      };
+      const move = (dx, dy) => {
+        const c = list[cur].rect;
+        const cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+        let best = -1, bestScore = Infinity;
+        list.forEach((o, i) => {
+          if (i === cur) return;
+          const ox = o.rect.x + o.rect.w / 2 - cx, oy = o.rect.y + o.rect.h / 2 - cy;
+          const along = dx ? ox * dx : oy * dy;
+          const across = dx ? Math.abs(oy) : Math.abs(ox);
+          if (along <= 1) return;
+          const s = along + 2 * across;
+          if (s < bestScore) { bestScore = s; best = i; }
+        });
+        if (best < 0 && dy) best = (cur + dy + list.length) % list.length;
+        if (best >= 0) { cur = best; draw(); }
+      };
+      const done = (v) => {
+        pickerActive = false;
+        window.removeEventListener("keydown", onKey, true);
+        layer.remove(); hud.remove();
+        resolve(v);
+      };
+      const onKey = (e) => {
+        const k = e.key;
+        if (k === "ArrowUp") move(0, -1);
+        else if (k === "ArrowDown") move(0, 1);
+        else if (k === "ArrowLeft") move(-1, 0);
+        else if (k === "ArrowRight") move(1, 0);
+        else if (k === "Tab") { cur = (cur + (e.shiftKey ? -1 : 1) + list.length) % list.length; draw(); }
+        else if (k === "Enter") return finish(e, list[cur].loose ? null : list[cur]);
+        else if (k === "Escape") return finish(e, undefined);
+        else return;
+        e.preventDefault(); e.stopPropagation();
+      };
+      const finish = (e, v) => { e.preventDefault(); e.stopPropagation(); done(v); };
+      pickerActive = true;
+      window.addEventListener("keydown", onKey, true);
+      draw();
+    });
+  }
+
+  // A source-field box for the mapping. Copies the shape of one CPI made itself when the mapping has one.
+  function makeSourceNode(ctx, entry, position) {
+    let sample = null;
+    ctx.viewer.getTransformation().getMappings().forEach((mp) => {
+      if (sample || !mp.destination || !mp.destination.expressionDetails) return;
+      walkRefs(mp.destination.expressionDetails.pinins, (ref) => { if (!sample && ref.graphicalNode) sample = ref.graphicalNode; });
+    });
+    let node;
+    if (sample) {
+      node = clone(sample);
+      const oldPath = sample.expressionPath;
+      const oldName = String(oldPath || "").split("/").pop();
+      (function swap(o) {
+        for (const k in o) {
+          const v = o[k];
+          if (typeof v === "string") { if (v === oldPath) o[k] = entry.xpath; else if (v && v === oldName) o[k] = entry.name; }
+          else if (v && typeof v === "object") swap(v);
+        }
+      })(node);
+    } else {
+      node = { expressionPath: entry.xpath, displayPath: entry.xpath, isXml: true, expressionDetails: { gid: "0", type: "Src", pinins: [] } };
+    }
+    renewIds(node);
+    node.expressionPath = entry.xpath;
+    node.expressionDetails = node.expressionDetails || { gid: "0", type: "Src", pinins: [] };
+    node.expressionDetails.objectId = node.expressionDetails.objectId || newId();
+    node.expressionDetails.position = position;
+    return node;
+  }
+
+  // slot: an item of freeInputs (connect there) or null (add to the mapping, not connected).
+  function addSourceField(entry, slot) {
+    const ctx = getContext();
+    const target = getSelectedTarget(ctx);
+    if (!target || !ctx.controller) throw new Error("no target field selected");
+    const m = getMappingOf(ctx, target.xpath) || createEmptyMapping(ctx, target);
+    let det = null;
+    let pin = null;
+    if (slot) {
+      det = slot.toTarget ? m.destination.expressionDetails : allDetails(m).find((d) => d.objectId === slot.detId);
+      pin = det && (det.pinins || []).find((p) => p.pinNum === (slot.toTarget ? 0 : slot.pinNum));
+      if (!pin) throw new Error("that input is gone – open the source picker again");
+    }
+    let position;
+    if (pin) {
+      const p = det.position || { x: 200, y: 40 };
+      position = { x: Math.max(0, p.x - 140), y: p.y + (slot.index || 0) * 40 };
+    } else {
+      const existing = allDetails(m).filter((d) => d.position);
+      position = { x: 10, y: existing.length ? Math.max(...existing.map((d) => d.position.y)) + 60 : 20 };
+    }
+    const node = makeSourceNode(ctx, entry, position);
+    if (pin) pin.pinout = { pinNum: pin.pinNum, expressionReference: { graphicalNode: node } };
+    else m.unconnected = (m.unconnected || []).concat([node]);
+    m.sourcePaths = [...new Set((m.sourcePaths || []).concat([entry.xpath]))];
+    if (pin) m.fn = Object.assign(m.fn || {}, { expression: expressionText(m.destination.expressionDetails.pinins) });
+    refreshMapping(ctx, m);
+  }
+
   // Adds the template to the selected field's mapping without connecting it, below what is already there,
   // so several templates can be combined and wired up by hand.
   function addTemplateUnconnected(tpl, withSources) {
@@ -623,17 +894,7 @@
     renewIds(pinins);
     const roots = pinins.map((p) => p.pinout && p.pinout.expressionReference).map(nodeOf).filter((n) => n && n.expressionDetails);
     if (!roots.length) throw new Error("the template has nothing left without its source fields");
-    let m = getMappingOf(ctx, target.xpath);
-    if (!m) {
-      // New mapping with an unconnected target field, like after deleting its only connection.
-      m = ctx.controller._createConstantMapping("", target.xpath);
-      m.destination = {
-        expressionPath: target.xpath, isXml: false, displayPath: target.xpath,
-        expressionDetails: { gid: "0", objectId: newId(), position: { x: 200, y: 40 }, pinins: [{ pinNum: 0 }], type: "Dst" },
-      };
-      m.sourcePaths = [];
-      m.fn = { expression: "" };
-    }
+    const m = getMappingOf(ctx, target.xpath) || createEmptyMapping(ctx, target);
     // Stored units (canvas / scale). Start below the lowest box already in the mapping.
     const existing = allDetails(m).filter((d) => d.position);
     let top = existing.length ? Math.max(...existing.map((d) => d.position.y)) + 60 : 20;
@@ -998,7 +1259,7 @@
 
   async function open(opts) {
     opts = opts || {};
-    if (host) { const keep = menuNode; close(); if (!opts.startSave) return; menuNode = keep; }
+    if (host) { const keep = menuNode; close(); if (!opts.startSave && !opts.startSource) return; menuNode = keep; }
     const ctx = getContext();
     const palette = ctx.palette;
     if (!palette || !ctx.editor) {
@@ -1034,7 +1295,7 @@
       <div class="box" role="dialog" aria-label="Add function">
         <div class="head"><span class="fx">fx</span>
           <input type="text" placeholder="Type a function or template name…" spellcheck="false" autocomplete="off">
-          <span class="hint">↑↓ Enter · Esc</span></div>
+          <span class="hint">↑↓ Enter · Esc · F1 keys</span></div>
         <ul role="listbox"></ul>
       </div>`;
     document.body.appendChild(host);
@@ -1056,7 +1317,9 @@
     // Returns [{title, items}] sections for the search mode.
     function buildSections(q) {
       const recent = loadRecent();
-      const actions = saveAction.concat(canSaveTemplate ? [
+      const actions = [{ kind: "action", id: "addSource", name: "Add source field to " + targetName + "…", tag: "source", tagClass: "local",
+        desc: "Pick a field of the source structure with the arrow keys, then the input it goes to (Alt+S)", words: "add source field input connect" },
+      ].concat(saveAction).concat(canSaveTemplate ? [
         { kind: "action", id: "format", name: "Format mapping of " + targetName, tag: "format",
           desc: "Arrange the steps in order: sources left, then each function, the target field on the right (Ctrl+Shift+F)", words: "format layout arrange tidy order" },
       ] : []).concat([
@@ -1067,6 +1330,8 @@
         { kind: "action", id: "import", name: "Import mappings from a file…", tag: "import", tagClass: "global",
           desc: "Loads an exported JSON file; fields are matched by their path in the target structure", words: "import upload load file json" },
       ]);
+      actions.push({ kind: "action", id: "help", name: "Keyboard shortcuts", tag: "help", tagClass: "global",
+        desc: "All keys and how to navigate (F1)", words: "help keyboard shortcuts keys navigation hotkeys" });
       if (noTarget) return [{ title: "No target field selected", items: q ? actions.filter((a) => a.words.includes(q.toLowerCase()) || a.name.toLowerCase().includes(q.toLowerCase())) : actions }];
       const tplItems = visibleTemplates().map((t) => ({ kind: "tpl", tpl: t }));
       if (q) {
@@ -1077,21 +1342,24 @@
         const list = tpls.concat(fnl).sort((a, b) => b.s - a.s).slice(0, MAX_RESULTS).map((r) => r.it);
         return [{ title: null, items: acts.concat(list) }];
       }
-      const used = fns.filter((f) => usageCount(f) > 0).sort((a, b) => usageCount(b) - usageCount(a) || byName(a, b));
+      const listed = fns.filter((f) => !isConstant(f)); // the constant is pinned to the top instead
+      const used = listed.filter((f) => usageCount(f) > 0).sort((a, b) => usageCount(b) - usageCount(a) || byName(a, b));
       const usedSet = new Set(used);
-      const rec = recent.map((k) => fns.find((f) => fnKey(f) === k)).filter((f) => f && !usedSet.has(f));
+      const rec = recent.map((k) => listed.find((f) => fnKey(f) === k)).filter((f) => f && !usedSet.has(f));
       const recSet = new Set(rec);
-      const rest = fns.filter((f) => !usedSet.has(f) && !recSet.has(f)).sort(byName);
+      const rest = listed.filter((f) => !usedSet.has(f) && !recSet.has(f)).sort(byName);
       const asFn = (l) => l.map((fn) => ({ kind: "fn", fn }));
       tplItems.sort((a, b) => (a.tpl.scope === b.tpl.scope ? a.tpl.name.localeCompare(b.tpl.name) : a.tpl.scope === "local" ? -1 : 1));
+      // With a target field selected, Enter on an empty box adds a constant.
+      const constFn = fns.find(isConstant);
       return [
+        { title: null, items: constFn ? [{ kind: "fn", fn: constFn }] : [] },
         { title: null, items: actions },
         { title: `Templates (${tplItems.length})`, items: tplItems },
         { title: usageLoading ? "Analysing mapping…" : `Used in this mapping (${used.length})`, items: asFn(used) },
         { title: "Recently used", items: asFn(rec) },
         { title: "All functions", items: asFn(rest) },
-      ].filter((s) => s.items.length || (s.title && s.title.startsWith("Analysing")));
-    }
+      ].filter((s) => s.items.length || (s.title && s.title.startsWith("Analysing")));    }
 
     function renderItem(it, idx, q) {
       const cls = idx === sel ? "sel" : "";
@@ -1128,7 +1396,7 @@
 
     function render() {
       const q = mode ? "" : input.value.trim();
-      const sections = mode ? [{ title: mode.title || null, items: mode.items }] : buildSections(q);
+      const sections = mode ? [{ title: mode.title || null, items: mode.build ? mode.build(input.value.trim()) : mode.items }] : buildSections(q);
       items = sections.flatMap((s) => s.items);
       sel = Math.min(sel, Math.max(0, items.length - 1));
       if (!items.length) {
@@ -1147,7 +1415,7 @@
     // Switches the box to a follow-up step (constant value, template name, with/without sources, …).
     function step(opts) {
       mode = opts;
-      sel = 0;
+      sel = opts.sel || 0;
       input.value = opts.value || "";
       input.placeholder = opts.placeholder || "";
       input.readOnly = !!opts.readOnly;
@@ -1214,6 +1482,78 @@
       });
     }
 
+    // Step 1: pick the source field (type to filter, arrows to move). Step 2: pick the input it goes to.
+    function askSourceField() {
+      if (readOnly || !target) { toast("Mapping Toolkit: select a target field in an editable mapping first."); return close(); }
+      let entries;
+      try { entries = sourceEntries(ctx); } catch (err) { close(); return fail("could not read the source structure", err); }
+      const used = new Set((targetMapping && targetMapping.sourcePaths) || []);
+      const current = getSelectedSourcePath(ctx);
+      const depthOf = (e) => e.xpath.split("/").filter(Boolean).length - 1;
+      const toItem = (e) => ({ kind: "choice", entry: e, name: "  ".repeat(Math.max(0, depthOf(e))) + e.name,
+        tag: used.has(e.xpath) ? "used" : "", tagClass: "local", desc: e.xpath });
+      const startAt = Math.max(0, entries.findIndex((e) => e.xpath === current));
+      step({
+        icon: "→", placeholder: "Source field for " + targetName + " – type to filter…", hint: "↑↓ Enter · Esc",
+        title: "Add source field", sel: startAt, empty: "No source field matches.",
+        build: (q) => {
+          const ql = q.toLowerCase();
+          const list = ql ? entries.filter((e) => e.xpath.toLowerCase().includes(ql))
+            .sort((a, b) => (b.name.toLowerCase().startsWith(ql) ? 1 : 0) - (a.name.toLowerCase().startsWith(ql) ? 1 : 0)) : entries;
+          return list.slice(0, 400).map(toItem);
+        },
+        onEnter: (it) => { if (it) askSourceSlot(it.entry); },
+      });
+    }
+
+    function askSourceSlot(entry) {
+      const slots = targetMapping ? freeInputs(ctx, targetMapping, targetName) : [];
+      // Preferred: move a selection box over the mapping on the canvas.
+      if (slots.some((s) => s.rect) && getCanvas()) {
+        close();
+        pickInputOnCanvas(slots, entry).then((c) => {
+          if (c === undefined) return;
+          if (c === "none") return toast("Mapping Toolkit: the mapping is not visible – could not show the selection.");
+          runAction("add source field", () => addSourceField(entry, c));
+        });
+        return;
+      }
+      const choices = slots.map((s) => ({ kind: "choice", slot: s,
+        name: s.isDst ? "Connect to " + targetName : "Connect to " + s.arg + " of " + s.title,
+        tag: s.isDst ? "target" : "input", tagClass: s.isDst ? "action" : "local",
+        desc: s.isDst ? "The field takes " + entry.name + " directly" : entry.name + " feeds " + s.title + ", input " + (s.index + 1) }));
+      if (!targetMapping) choices.push({ kind: "choice", slot: { toTarget: true }, name: "Connect to " + targetName, tag: "target", tagClass: "action",
+        desc: "The field is not mapped yet – it takes " + entry.name + " directly" });
+      choices.push({ kind: "choice", slot: null, name: "Add to the mapping, not connected", tag: "add", tagClass: "local",
+        desc: "Wire it up yourself" });
+      step({
+        icon: "→", value: entry.name, readOnly: true, hint: "↑↓ Enter · Esc", title: "Where should " + entry.name + " go?", items: choices,
+        onEnter: (it) => { if (it) run("add source field", () => addSourceField(entry, it.slot)); },
+      });
+    }
+
+    function askHelp() {
+      const row = (keys, name, desc) => ({ kind: "choice", name, tag: keys, tagClass: "action", desc });
+      step({
+        icon: "?", value: "", readOnly: true, placeholder: "Keyboard shortcuts", hint: "Enter or Esc to close", title: "Keyboard shortcuts",
+        items: [
+          row("Space", "Open this box", "For the selected target field, when you are not typing in a field"),
+          row("Ctrl+Space", "Open this box (always works)", "Also closes it again"),
+          row("Alt+S", "Add a source field", "Pick the field, then move the selection box on the canvas to the input"),
+          row("Tab / Shift+Tab", "Switch between source, target and mapping expression", "Outside the box; the active part is outlined in blue"),
+          row("← ↑ ↓ →  Tab", "Move the selection box", "On the canvas, after picking a source field or a function in a mapped field; Enter places it, Esc cancels"),
+          row("Ctrl+Shift+F", "Format the selected mapping", "Arranges sources, functions and the target field in order"),
+          row("↑ ↓  PgUp PgDn", "Move through the list", "In this box and in the source field picker"),
+          row("Enter", "Choose / insert", "Goes to the next step where there is one"),
+          row("Del", "Delete the selected template", "In the list, on a template"),
+          row("Del", "Delete the box you clicked", "On the canvas: a function, constant or source field (not the target field)"),
+          row("F1", "Show this list", "Inside the box"),
+          row("Esc", "Close / cancel", ""),
+        ],
+        onEnter: () => close(),
+      });
+    }
+
     function askImport() {
       step({
         icon: "⇪", value: "", readOnly: true, placeholder: "Import mappings", hint: "↑↓ Enter · Esc", title: "Import mappings from a file",
@@ -1256,6 +1596,8 @@
       const it = items[i];
       if (mode) { if (mode.onEnter) mode.onEnter(it, input.value); return; }
       if (!it) return;
+      if (it.kind === "action" && it.id === "help") return askHelp();
+      if (it.kind === "action" && it.id === "addSource") return askSourceField();
       if (it.kind === "action" && it.id === "save") return askSaveTemplate();
       if (it.kind === "action" && it.id === "format") return run("format mapping", formatSelected);
       if (it.kind === "action" && it.id === "formatAll") {
@@ -1272,7 +1614,7 @@
       }
     }
 
-    input.addEventListener("input", () => { if (mode) return; sel = 0; render(); });
+    input.addEventListener("input", () => { if (mode && !mode.build) return; sel = 0; render(); });
     input.addEventListener("keydown", (e) => {
       const n = items.length;
       if (e.key === "ArrowDown") { sel = Math.min(n - 1, sel + 1); render(); e.preventDefault(); }
@@ -1281,6 +1623,7 @@
       else if (e.key === "PageUp") { sel = Math.max(0, sel - 8); render(); e.preventDefault(); }
       else if (e.key === "Enter") { choose(sel); e.preventDefault(); }
       else if (e.key === "Delete" && !mode && items[sel] && items[sel].kind === "tpl") { askDeleteTemplate(items[sel].tpl); e.preventDefault(); }
+      else if (e.key === "F1") { askHelp(); e.preventDefault(); }
       else if (e.key === "Escape" || (e.key === " " && e.ctrlKey)) { close(); e.preventDefault(); }
     });
     ul.addEventListener("mousemove", (e) => {
@@ -1299,7 +1642,8 @@
           desc: inFlow ? "Presses Edit on the integration flow and opens this mapping again in Edit mode" : "Presses Edit" }],
         onEnter: () => run("switch to Edit mode", switchToEditMode),
       });
-    } else if (opts.startSave && saveAction.length) askSaveTemplate();
+    } else if (opts.startSource) askSourceField();
+    else if (opts.startSave && saveAction.length) askSaveTemplate();
   }
 
   // ---------- toolbar button next to Simulate ----------
@@ -1316,7 +1660,7 @@
       if (!Button) return;
       const btn = new Button(id, {
         icon: ICON_URL, text: "Mapping Toolkit", hideText: false, type: "Transparent",
-        tooltip: "CI Mapping Toolkit (Space / Ctrl+Space): functions, constants, templates, format, export/import",
+        tooltip: "CI Mapping Toolkit (Space / Ctrl+Space): functions, constants, templates, format, export/import\nAlt+S add source field · Ctrl+Shift+F format · F1 in the box: all keys",
         press: () => open(),
       });
       const acts = h.getActions();
@@ -1347,12 +1691,117 @@
   // field, code editor, button, link or checkbox, and a message mapping must be showing.
   const NO_SPACE_SEL = "input, textarea, select, button, a[href], [contenteditable=''], [contenteditable='true'], " +
     "[role='textbox'], [role='combobox'], [role='button'], [role='checkbox'], [role='radio'], [role='switch'], [role='menuitem'], .ace_editor";
-  function spaceMayOpen() {
+  function typingInField() {
     let el = document.activeElement;
     while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
-    if (el && el !== document.body && el.closest && el.closest(NO_SPACE_SEL)) return false;
+    return !!(el && el !== document.body && el.closest && el.closest(NO_SPACE_SEL));
+  }
+  function spaceMayOpen() {
+    if (typingInField()) return false;
     const ctx = getContext();
     return !!(ctx.viewer && ctx.editor);
+  }
+
+  // ---------- Tab cycles source structure → target structure → mapping expression ----------
+  function paneElements(ctx) {
+    const dom = (t) => { try { return t && t.getDomRef && t.getDomRef(); } catch (_) { return null; } };
+    let src = null, tgt = null;
+    try { src = dom(ctx.viewer._getSourceTable()); } catch (_) { /* older/newer editor */ }
+    try { tgt = dom(ctx.viewer._getTargetTable()); } catch (_) { /* older/newer editor */ }
+    return [
+      { id: "source", label: "Source structure", el: src },
+      { id: "target", label: "Target structure", el: tgt },
+      { id: "expression", label: "Mapping expression", el: getCanvas() },
+    ].filter((p) => p.el && p.el.isConnected && p.el.offsetWidth > 0);
+  }
+
+  function paneOfNode(panes, node) {
+    while (node && node.nodeType !== 1) node = node.parentNode || node.host;
+    return panes.find((p) => p.el.contains(node)) || null;
+  }
+
+  let paneBadge = null;
+  let paneBadgeTimer = null;
+  let lastOutlined = null;
+  function outlinePane(pane) {
+    if (lastOutlined && lastOutlined !== (pane && pane.el)) lastOutlined.style.outline = "";
+    lastOutlined = pane ? pane.el : null;
+    if (!pane) return;
+    Object.assign(pane.el.style, { outline: "2px solid #0a6ed1", outlineOffset: "-2px" });
+    if (!paneBadge) {
+      paneBadge = document.createElement("div");
+      Object.assign(paneBadge.style, { position: "fixed", zIndex: 2147483645, pointerEvents: "none", background: "#0a6ed1", color: "#fff",
+        padding: "2px 10px", borderRadius: "0 0 6px 0", font: '12px "72", Arial, sans-serif' });
+      document.body.appendChild(paneBadge);
+    }
+    const r = pane.el.getBoundingClientRect();
+    paneBadge.textContent = pane.label + "  ·  Tab: next";
+    Object.assign(paneBadge.style, { left: r.left + "px", top: r.top + "px", display: "block" });
+    clearTimeout(paneBadgeTimer);
+    paneBadgeTimer = setTimeout(() => { if (paneBadge) paneBadge.style.display = "none"; }, 1800);
+  }
+
+  function focusPane(pane) {
+    const el = pane.el;
+    let f = null;
+    if (pane.id !== "expression") {
+      // UI5 tables keep the current cell at tabindex 0; prefer the selected row.
+      f = el.querySelector("tr.sapUiTableRowSel [tabindex='0'], tr.sapUiTableRowSel [tabindex]") || el.querySelector("[tabindex='0']") || el.querySelector("[tabindex]");
+    }
+    if (!f) { if (el.tabIndex < 0 && !el.hasAttribute("tabindex")) el.tabIndex = -1; f = el; }
+    f.focus({ preventScroll: true });
+    outlinePane(pane);
+  }
+
+  // Tab / Shift+Tab. Returns true when the key was used.
+  function cyclePanes(back) {
+    if (host || pickerActive || typingInField()) return false;
+    const ctx = getContext();
+    if (!ctx.viewer || !ctx.editor) return false;
+    const panes = paneElements(ctx);
+    if (panes.length < 2) return false;
+    const from = paneOfNode(panes, document.activeElement) || paneOfNode(panes, lastPaneClick);
+    if (!from && document.activeElement && document.activeElement !== document.body) return false; // focus is somewhere else on the page
+    const i = from ? panes.indexOf(from) : (back ? 0 : -1);
+    focusPane(panes[(i + (back ? -1 : 1) + panes.length) % panes.length]);
+    return true;
+  }
+
+  // Keep the outline in step with clicks and focus that did not come from Tab.
+  let lastPaneClick = null;
+  document.addEventListener("mousedown", (e) => { lastPaneClick = e.target; }, true);
+  document.addEventListener("focusin", (e) => {
+    try {
+      if (host) return;
+      const ctx = getContext();
+      if (!ctx.viewer) return;
+      outlinePane(paneOfNode(paneElements(ctx), e.target));
+    } catch (_) { /* editor not ready */ }
+  }, true);
+  document.addEventListener("mouseup", () => {
+    try {
+      if (host) return;
+      const ctx = getContext();
+      if (!ctx.viewer) return;
+      const p = paneOfNode(paneElements(ctx), lastPaneClick);
+      if (p) outlinePane(p);
+    } catch (_) { /* editor not ready */ }
+  }, true);
+
+  // Delete: remove the box last clicked on the canvas (a function, constant or source field – never the target field).
+  function deleteClickedNode() {
+    if (host || pickerActive || typingInField()) return false;
+    const ctx = getContext();
+    if (!ctx.viewer || !ctx.editor || !ctx.renderer || !isEditMode(ctx)) return false;
+    const node = getClickedNode(ctx, 0); // the click has to be on the box itself
+    if (!node) return false;
+    const expr = getExpression(ctx);
+    delete expr.nodes[node.id];
+    expr.connections = (expr.connections || []).filter((c) => c.fromId !== node.id && c.toId !== node.id);
+    lastCanvasClick = null;
+    commit(ctx, expr);
+    toast("Mapping Toolkit: deleted " + (node.name || node.key || "the box") + ".");
+    return true;
   }
 
   window.addEventListener("keydown", (e) => {
@@ -1360,6 +1809,20 @@
       e.preventDefault();
       e.stopPropagation();
       open();
+      return;
+    }
+    if (e.key === "Tab" && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      try { if (cyclePanes(e.shiftKey)) { e.preventDefault(); e.stopPropagation(); } } catch (err) { fail("could not switch", err); }
+      return;
+    }
+    if (e.key === "Delete" && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) {
+      try { if (deleteClickedNode()) { e.preventDefault(); e.stopPropagation(); } } catch (err) { fail("could not delete", err); }
+      return;
+    }
+    if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.code === "KeyS") {
+      // Alt+S: add a source field to the selected target field's mapping (works from anywhere in the mapping editor).
+      const c = getContext();
+      if (c.viewer && c.editor) { e.preventDefault(); e.stopPropagation(); open({ startSource: true }); }
       return;
     }
     if (e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && (e.code === "KeyF" || e.key === "F" || e.key === "f")) {

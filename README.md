@@ -90,10 +90,14 @@ in the message mapping editor.
 |---|---|---|
 | **Space** | Mapping editor, not typing in a field | Open the search box for the selected target field |
 | **Ctrl+Space** | Mapping editor | Open the search box (always works) |
+| **Alt+S** | Mapping editor, target field selected | Add a source field: type to filter, **↑ / ↓** to choose, **Enter**; then move the selection box on the canvas with **← ↑ ↓ → / Tab** to the input it connects to (the target field or a free input of a function) or to the *not connected* spot at the bottom, and press **Enter** (**Esc** cancels) |
+| **Tab / Shift+Tab** | Mapping editor, focus in source, target or expression | Jump between the source structure, the target structure and the mapping expression only; the active one is outlined in blue |
 | **Ctrl+Shift+F** | Mapping editor, mapped field selected | Format the mapping of the selected field |
 | **↑ / ↓, PgUp / PgDn** | Search box | Move through the list |
 | **Enter** | Search box | Insert / choose |
 | **Del** | Search box, on a template | Delete the template |
+| **Del** | Mapping canvas, after clicking a box | Delete that function, constant or source field (not the target field) |
+| **F1** | Search box | Show this list of shortcuts inside the tool |
 | **Esc** | Search box | Close |
 
 Plain Space never interferes with typing: in a text field (a constant's value, a search field, the script
@@ -102,13 +106,17 @@ editor) or on a focused button it keeps its normal meaning.
 ## Feature guide
 
 ### Functions and constants
+- With a target field selected, the first entry in the empty box is **constant**, so **Space, Enter, value,
+  Enter** maps a constant.
 - The list matches by prefix, substring, camelCase initials (`fbe` → *formatByExample*) and description.
 - Order: functions used in this mapping (with a usage count), your recently used functions, then all
   functions A–Z.
 - A new function is placed at the mouse position when the mouse is over the Mapping Expression canvas,
   otherwise next to the target field.
-- For an unmapped field the function is connected to the field. For a mapped field it is added so you
-  can wire it where you want.
+- For an unmapped field the function is connected to the field. For a mapped field a selection box appears
+  on the canvas: move it with **← ↑ ↓ → / Tab** to the input the function should feed (the target field or a
+  free input of another function) and press **Enter**, or choose *not connected* (the last stop) to wire it
+  yourself. **Esc** cancels.
 
 ### Templates
 - **Save the whole field:** select a mapped field, open the box and choose
